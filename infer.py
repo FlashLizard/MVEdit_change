@@ -13,7 +13,7 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 
 from functools import partial
-from lib.core.webui.shared_opts import send_to_click
+from lib.core.webui.shared_opts import send_to_click, set_seed
 from lib.core.webui.tab_img_to_3d import create_interface_img_to_3d
 from lib.core.webui.tab_3d_to_3d import create_interface_3d_to_3d
 from lib.core.webui.tab_text_to_img_to_3d import create_interface_text_to_img_to_3d
@@ -24,11 +24,8 @@ from lib.apis.adapter3d import Adapter3DRunner
 from lib.version import __version__
 
 
-from lib.core.webui.parameters import image_defaults
 
-from lib.core.webui.parameters import (
-    parse_3d_args, parse_2d_args, parse_retex_args, parse_stablessdnerf_args,
-    parse_mesh_optim_args, parse_superres_args)
+from lib.core.webui.parameters import (image_defaults, nerf_mesh_defaults, superres_defaults)
 from diffusers import (
     EulerAncestralDiscreteScheduler, AutoencoderKL, UNet2DConditionModel, ControlNetModel, StableDiffusionPipeline)
 
@@ -36,6 +33,8 @@ from mmcv.runner import set_random_seed
 from lib.pipelines.utils import (
     init_base_modules, init_mvedit, rgba_to_rgb, do_segmentation, do_segmentation_pil, pad_rgba_image, join_prompts,
     zero123plus_postprocess, init_instant3d, init_zero123plus)
+
+import PIL.Image as Image
 
 DEBUG_SAVE_INTERVAL = {
     0: None,
@@ -87,11 +86,114 @@ def parse_args():
 #         print('Text-to-Image finished.')
 #         return out_img
 
+def create_base_opts(var_dict,
+                     scheduler='EulerAncestralDiscrete',
+                     scheduler_dropdown=['DPMSolverMultistep', 'DPMSolverMultistepKarras',
+                                         'DPMSolverSDE', 'DPMSolverSDEKarras',
+                                         'EulerAncestralDiscrete', 'DDIM'],
+                     steps=24,
+                     denoising_strength=0.5,
+                     random_init=False,
+                     cfg_scale=7,
+                     adapter_scale=None,
+                     render=True):
+    var_dict['scheduler'] = scheduler
+    var_dict['steps'] = steps
+    if denoising_strength is not None:
+        var_dict['denoising_strength'] = denoising_strength
+        var_dict['random_init'] = random_init
+    if adapter_scale is None:
+        var_dict['cfg_scale'] = cfg_scale
+    else:
+        var_dict['cfg_scale'] =cfg_scale
+        var_dict['adapter_scale'] =adapter_scale
+
+def create_prompt_opts(var_dict):
+    var_dict['prompt'] = 'a red car'
+    var_dict['negative_prompt'] = ''
+
 def text_to_img(sd_api):
-    default_var_dict = {k: v for k, v in image_defaults.items()}
+    var_dict = dict()
+    create_prompt_opts(var_dict)
+    create_base_opts(
+        var_dict,
+        steps=32, denoising_strength=None, cfg_scale=image_defaults['cfg_scale'])
+    
+    default_var_dict = {
+        k: v for k, v in image_defaults.items()
+        if k not in var_dict}
     text_to_img_fun = partial(sd_api, **default_var_dict)
-    seed = 100
-    return text_to_img_fun(seed)
+    img_to_3d_inputs = {k: var_dict[k] for k in image_defaults.keys()
+                        if k not in default_var_dict}
+    var_dict['last_seed'] = set_seed(100)
+    return text_to_img_fun(var_dict['last_seed'], **img_to_3d_inputs)
+
+def create_superres_opts(
+        var_dict,
+        superres_defaults,
+        do_superres=True, use_ip_adapter=False, scheduler='EulerAncestralDiscrete',
+        scheduler_dropdown=['DPMSolverMultistep', 'DPMSolverMultistepKarras',
+                            'DPMSolverSDE', 'DPMSolverSDEKarras',
+                            'EulerAncestralDiscrete', 'DDIM'],
+        steps=24, denoising_strength=0.4, random_init=False,
+        n_inverse_steps=48,
+        show_advanced=True):
+    var_dict['do_superres'] = do_superres
+    var_dict['use_ip_adapter'] = use_ip_adapter
+    create_base_opts(
+        var_dict, scheduler=scheduler, scheduler_dropdown=scheduler_dropdown,
+        steps=steps, denoising_strength=denoising_strength,
+        random_init=random_init, cfg_scale=superres_defaults['cfg_scale'])
+
+def img_to_3d(
+        segmentation_api, zero123plus_api, mvedit_api, api_names=None, advanced=True, init_inverse_steps=640,
+        n_inverse_steps=96, diff_bs=6, tet_resolution=128, superres_n_inverse_steps=640, num_passes=6,
+        pred_normal=False, image=None):
+    default_var_dict = dict(
+        init_inverse_steps=init_inverse_steps, n_inverse_steps=n_inverse_steps, diff_bs=diff_bs,
+        tet_resolution=tet_resolution)
+    default_superres_var_dict = dict(
+        n_inverse_steps=superres_n_inverse_steps)
+
+    var_dict = dict()
+    create_prompt_opts(var_dict)
+    create_base_opts(
+        var_dict, scheduler='DPMSolverMultistep',
+        steps=24, denoising_strength=0.5, random_init=False,
+        cfg_scale=nerf_mesh_defaults['cfg_scale'])
+    var_dict['superres'] = dict()
+    create_superres_opts(
+        var_dict['superres'], superres_defaults,
+        use_ip_adapter=True, scheduler='DPMSolverSDEKarras',
+        n_inverse_steps=superres_n_inverse_steps, show_advanced=advanced)
+
+    default_var_dict = {
+        k: default_var_dict.get(k, v) for k, v in nerf_mesh_defaults.items()
+        if k not in var_dict}
+    default_superres_var_dict = {
+        'superres_' + k: default_superres_var_dict.get(k, v) for k, v in superres_defaults.items()
+        if k not in var_dict['superres']}
+    img_to_3d_fun = partial(mvedit_api, **default_var_dict, **default_superres_var_dict,
+                            cache_dir='cache')
+    img_to_3d_inputs =  [var_dict[k] for k in nerf_mesh_defaults.keys()
+                        if k not in default_var_dict] + \
+                        [var_dict['superres'][k] for k in superres_defaults.keys()
+                        if 'superres_' + k not in default_superres_var_dict]
+    
+    seed = set_seed(100)
+    fg_image = segmentation_api(image)
+    fg_image.save('outputs/fg_image.png')
+    print("Segmentation done")
+    var_dict['fg_image'] = fg_image
+    var_dict['zero123plus_outputs'] = images = zero123plus_api(seed, fg_image)
+    print("Zero123++ done")
+    for i, img in enumerate(images):
+        img.save(f'outputs/zero123plus_output_{i}.png')
+    model_outputs = img_to_3d_fun(seed,images, **img_to_3d_inputs)
+    print("3D model generated")
+
+    return model_outputs
+
 
 def main():
     args = parse_args()
@@ -108,9 +210,12 @@ def main():
         debug=args.debug > 0,
         no_safe=args.no_safe
     )
-    image = text_to_img(runner.run_text_to_img)
-    print("Image generated")
-    image.save('outputs/output.png')
+    # image = text_to_img(runner.run_text_to_img)
+    # print("Image generated")
+    # image.save('outputs/output.png')
+    image = Image.open('outputs/output.png')
+
+    model_outputs = img_to_3d(runner.run_segmentation, runner.run_zero123plus1_2, runner.run_zero123plus1_2_to_mesh, image=image)
 
 if __name__ == '__main__':
     main()
