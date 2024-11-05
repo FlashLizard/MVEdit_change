@@ -175,21 +175,33 @@ def img_to_3d(
         if k not in var_dict['superres']}
     img_to_3d_fun = partial(mvedit_api, **default_var_dict, **default_superres_var_dict,
                             cache_dir='cache')
-    img_to_3d_inputs =  [var_dict[k] for k in nerf_mesh_defaults.keys()
-                        if k not in default_var_dict] + \
-                        [var_dict['superres'][k] for k in superres_defaults.keys()
-                        if 'superres_' + k not in default_superres_var_dict]
     
     seed = set_seed(100)
     fg_image = segmentation_api(image)
     fg_image.save('outputs/fg_image.png')
     print("Segmentation done")
     var_dict['fg_image'] = fg_image
-    var_dict['zero123plus_outputs'] = images = zero123plus_api(seed, fg_image)
+    
+    images = []
+    for i in range(72):
+        images.append(Image.open(f'outputs/zero123plus_output_{i}.png'))
+        print(f"Image {i} loaded")
+    
+    
+    # images = zero123plus_api(seed, fg_image)
+    var_dict['zero123plus_outputs'] = images
     print("Zero123++ done")
-    for i, img in enumerate(images):
-        img.save(f'outputs/zero123plus_output_{i}.png')
-    model_outputs = img_to_3d_fun(seed,images, **img_to_3d_inputs)
+    
+    # for i, img in enumerate(images):
+    #     img.save(f'outputs/zero123plus_output_{i}.png')
+
+    img_to_3d_inputs = [var_dict['fg_image']] + \
+                    [var_dict[k] for k in nerf_mesh_defaults.keys()
+                    if k not in default_var_dict] + \
+                    [var_dict['superres'][k] for k in superres_defaults.keys()
+                    if 'superres_' + k not in default_superres_var_dict] + \
+                    var_dict['zero123plus_outputs']
+    model_outputs = img_to_3d_fun(seed, images, *img_to_3d_inputs)
     print("3D model generated")
 
     return model_outputs
@@ -216,6 +228,8 @@ def main():
     image = Image.open('outputs/output.png')
 
     model_outputs = img_to_3d(runner.run_segmentation, runner.run_zero123plus1_2, runner.run_zero123plus1_2_to_mesh, image=image)
+    print("3D model generated")
+    model_outputs.save('outputs/model.obj')
 
 if __name__ == '__main__':
     main()
